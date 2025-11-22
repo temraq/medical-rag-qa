@@ -7,18 +7,15 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from datetime import datetime
 import logging
+import os
 import time
-from tqdm import tqdm
-from accelerate import infer_auto_device_map, init_empty_weights
-from transformers import AutoConfig
-
 
 # 🎯 НАСТРОЙКА ЛОГИРОВАНИЯ
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler("/app/logs/api.log"),
+        logging.FileHandler("/tmp/api.log"),  # Cloud Run использует /tmp
         logging.StreamHandler()
     ]
 )
@@ -26,118 +23,138 @@ logging.basicConfig(
 logger = logging.getLogger("RAG-API")
 app = FastAPI()
 
-# Конфигурация модели
-MODEL_NAME = "models/zephyr_base_model"
-ADAPTERS_PATH = "models/zephyr_medical_rag_adapter"
-INDEX_PATH = "index/pubmed_rag_index"
+# Автоматическое определение окружения Cloud Run
+IS_CLOUD_RUN = os.environ.get("K_SERVICE") is not None
+
+# Конфигурация моделей (пути для загрузки из GCS)
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "your-bucket-name")
+MODEL_GCS_PATH = os.environ.get("MODEL_GCS_PATH", "zephyr-7b-base")
+ADAPTERS_GCS_PATH = os.environ.get("ADAPTERS_GCS_PATH", "zephyr-medical-adapter")
+INDEX_GCS_PATH = os.environ.get("INDEX_GCS_PATH", "pubmed-rag-index")
+
+# Локальные пути внутри контейнера
+BASE_DIR = "/app"
+MODEL_LOCAL_PATH = f"{BASE_DIR}/models/zephyr_base_model"
+ADAPTERS_LOCAL_PATH = f"{BASE_DIR}/models/zephyr_medical_rag_adapter"
+INDEX_LOCAL_PATH = f"{BASE_DIR}/index/pubmed_rag_index"
+
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 MIN_RELEVANCE_THRESHOLD = 0.55
-MAX_CONTEXT_LENGTH = 512
+MAX_CONTEXT_LENGTH = 512 if not IS_CLOUD_RUN else 384  # Уменьшаем для Cloud Run
 
-logger.info("Starting RAG API server...")
+logger.info(f"🚀 Запуск RAG API сервера в режиме: {'Cloud Run' if IS_CLOUD_RUN else 'Local'}")
 
-def create_progress_bar(total_steps, desc="Loading"):
-    """Создает прогресс-бар для отслеживания загрузки"""
-    return tqdm(total=total_steps, desc=desc, unit="step", colour='green')
-
-try:
-    logger.info("\n📦 Загрузка токенизатора...")
-    pbar_tokenizer = create_progress_bar(2, desc="Loading tokenizer")
-
-    # Загрузка токенизатора
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    pbar_tokenizer.update(1)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    pbar_tokenizer.update(1)
-    pbar_tokenizer.close()
+def download_from_gcs(bucket_name, gcs_path, local_path):
+    """Загружает файлы из Google Cloud Storage"""
+    if not bucket_name:
+        logger.warning("GCS_BUCKET_NAME не указан, пропускаем загрузку")
+        return False
     
-    logger.info("✅ Токенизатор загружен.")
-    logger.info("\n🤖 Загрузка модели на CPU с offloading на диск...")
-    pbar_model = create_progress_bar(3, desc="Loading model")
+    try:
+        os.makedirs(local_path, exist_ok=True)
+        logger.info(f"⬇️ Загрузка из gs://{bucket_name}/{gcs_path} в {local_path}")
+        
+        # Используем gsutil для загрузки
+        import subprocess
+        cmd = f"gsutil -m cp -r gs://{bucket_name}/{gcs_path}/* {local_path}/"
+        result = subprocess.run(cmd, shell=True, check=True, text=True, capture_output=True)
+        logger.info(f"✅ Загрузка успешна: {result.stdout}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки из GCS: {e}")
+        return False
 
-    config = AutoConfig.from_pretrained(MODEL_NAME)
-
-    # Определяем, сколько RAM доступно (например, 6 ГБ для модели, остальное — системе)
-    # Если у вас мало RAM (<16 ГБ), уменьшите "cpu" до "4GiB"
-    max_memory = {
-        "cpu": "4GiB",      # ← подстройте под вашу систему
-        "disk": "20GiB"     # виртуальная "память" на диске
+def ensure_models_available():
+    """Гарантирует наличие всех моделей и индекса"""
+    logger.info("🔍 Проверка наличия моделей и индекса...")
+    
+    # Загружаем базовую модель
+    if not os.path.exists(MODEL_LOCAL_PATH) or not os.listdir(MODEL_LOCAL_PATH):
+        logger.info("🔄 Базовая модель отсутствует - загружаем из GCS")
+        download_from_gcs(GCS_BUCKET_NAME, MODEL_GCS_PATH, MODEL_LOCAL_PATH)
+    
+    # Загружаем адаптеры
+    if not os.path.exists(ADAPTERS_LOCAL_PATH) or not os.listdir(ADAPTERS_LOCAL_PATH):
+        logger.info("🔄 Адаптеры отсутствуют - загружаем из GCS")
+        download_from_gcs(GCS_BUCKET_NAME, ADAPTERS_GCS_PATH, ADAPTERS_LOCAL_PATH)
+    
+    # Загружаем индекс
+    if not os.path.exists(INDEX_LOCAL_PATH) or not os.listdir(INDEX_LOCAL_PATH):
+        logger.info("🔄 FAISS индекс отсутствует - загружаем из GCS")
+        download_from_gcs(GCS_BUCKET_NAME, INDEX_GCS_PATH, INDEX_LOCAL_PATH)
+    
+    # Проверяем результат
+    paths = {
+        "базовая модель": MODEL_LOCAL_PATH,
+        "адаптеры": ADAPTERS_LOCAL_PATH,
+        "индекс": INDEX_LOCAL_PATH
     }
-
-    # Автоматическое распределение слоёв между CPU и диском
-    device_map = infer_auto_device_map(
-        AutoModelForCausalLM.from_config(config),
-        max_memory=max_memory,
-        no_split_module_classes=["LlamaDecoderLayer"],
-        dtype=torch.float16  # или torch.bfloat16, если поддерживается
-    )
-
-    logger.info(f"Сгенерирован device_map: {device_map}")
-
-    # Загружаем модель БЕЗ квантизации
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        device_map=device_map,
-        offload_folder="offload",
-        offload_state_dict=True,
-        torch_dtype=torch.float16,  # экономия памяти vs float32
-        low_cpu_mem_usage=True,
-        trust_remote_code=False
-    )
-    pbar_model.update(2)
-
-    # Применяем адаптеры (LoRA) — они работают на CPU
-    logger.info("🔧 Применение адаптеров...")
-    model = PeftModel.from_pretrained(model, ADAPTERS_PATH)
-    model.eval()
-    pbar_model.update(1)
-    pbar_model.close()
-    logger.info("✅ Модель и адаптеры загружены на CPU с offloading.")
     
-    # Загрузка FAISS индекса (без изменений)
-    logger.info("🌐 Загрузка модели эмбеддингов...")
-    pbar_embeddings = create_progress_bar(2, desc="Loading embeddings")
-    embedding_model = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True}
-    )
-    pbar_embeddings.update(1)
-    logger.info("Loading FAISS index from %s...", INDEX_PATH)
-    pbar_faiss = create_progress_bar(1, desc="Loading FAISS index")
-    vector_db = FAISS.load_local(
-        INDEX_PATH,
-        embedding_model,
-        allow_dangerous_deserialization=True
-    )
-    pbar_faiss.update(1)
-    pbar_faiss.close()
-    pbar_embeddings.close()
+    missing = [name for name, path in paths.items() if not os.path.exists(path) or not os.listdir(path)]
     
-except Exception as e:
-    logger.exception(f"Initialization failed: {e}")  # ← лучше логировать traceback
+    if missing:
+        error_msg = f"❌ Не удалось загрузить компоненты: {', '.join(missing)}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+    
+    logger.info("✅ Все компоненты успешно загружены")
 
-# Функция smart_retrieve (адаптированная для CPU)
+# Загрузка моделей перед запуском API
+ensure_models_available()
+
+# Инициализация моделей
+tokenizer = None
+model = None
+vector_db = None
+
+logger.info("\n📦 Загрузка токенизатора...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_LOCAL_PATH)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+logger.info("✅ Токенизатор загружен.")
+
+logger.info("\n🤖 Загрузка модели в 4-bit для Cloud Run...")
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_LOCAL_PATH,
+    quantization_config=bnb_config,
+    device_map="auto",
+    offload_folder="/tmp/offload",
+    trust_remote_code=False
+)
+
+logger.info("🔧 Применение адаптеров...")
+model = PeftModel.from_pretrained(model, ADAPTERS_LOCAL_PATH)
+model.eval()
+logger.info("✅ Модель и адаптеры загружены.")
+
+logger.info("🌐 Загрузка модели эмбеддингов...")
+embedding_model = HuggingFaceEmbeddings(
+    model_name=EMBEDDING_MODEL,
+    model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+    encode_kwargs={"normalize_embeddings": True}
+)
+
+logger.info(f"Loading FAISS index from {INDEX_LOCAL_PATH}...")
+vector_db = FAISS.load_local(
+    INDEX_LOCAL_PATH,
+    embedding_model,
+    allow_dangerous_deserialization=True
+)
+logger.info("✅ FAISS index loaded successfully.")
+
+# Функция smart_retrieve (без изменений)
 def smart_retrieve(query, k=3):
-    """
-    Параметры:
-    - query: текстовый запрос
-    - k: количество результатов для возврата
-
-    Возвращает:
-    - Список документов
-    - Список соответствующих скоров релевантности
-    """
-    # Получаем базовые результаты с их расстояниями
-
     base_results = vector_db.similarity_search_with_relevance_scores(query, k=20)
     doc_to_score = {doc.metadata["id"]: score for doc, score in base_results}
 
-    # Определяем тип запроса и устанавливаем оптимальный параметр lambda
     query_lower = query.lower()
-
-  # 1. Более точное определение типов запросов
     medical_guideline_keywords = ["guideline", "standard", "recommendation", "protocol", "consensus", "algorithm"]
     diagnostic_keywords = ["diagnos", "criteria", "symptom", "sign", "test", "screening"]
     treatment_keywords = ["treat", "therapy", "management", "intervention", "medication", "drug"]
@@ -145,86 +162,59 @@ def smart_retrieve(query, k=3):
     is_guideline = any(kw in query_lower for kw in medical_guideline_keywords)
     is_diagnostic = any(kw in query_lower for kw in diagnostic_keywords)
     is_treatment = any(kw in query_lower for kw in treatment_keywords)
-
-  # 2. Используем токены вместо слов для оценки длины
     token_count = len(tokenizer.encode(query))
 
-    # 3. Оптимизированные значения lambda для медицинских сценариев
     if is_guideline:
-        # Для клинических рекомендаций нужна МАКСИМАЛЬНАЯ точность
-        # 0.98 оставляет всего 2% на разнообразие (минимум необходимого)
         lam = 0.98
         reason = "Клиническая рекомендация"
-
     elif is_diagnostic or is_treatment:
-        # Для диагностических и лечебных запросов важна точность, но нужен некоторый контекст
         lam = 0.88
         reason = "Диагностика/лечение"
-
-    elif token_count > 40:  # Более разумный порог (40 токенов вместо 8 слов)
-        # Для действительно длинных запросов
+    elif token_count > 40:
         lam = 0.75
         reason = "Длинный запрос (>40 токенов)"
-
     else:
-        # Для коротких и общих запросов
         lam = 0.82
         reason = "Общий запрос"
 
-    print(f"Определен тип запроса: {reason}, lambda = {lam:.2f}")
+    logger.info(f"Определен тип запроса: {reason}, lambda = {lam:.2f}")
 
-    # Улучшенный MMR с большим fetch_k для лучшего разнообразия
     mmr_results = vector_db.max_marginal_relevance_search(
         query,
         k=k,
         lambda_mult=lam,
-        fetch_k=20  # Увеличиваем для лучшего выбора
+        fetch_k=20
     )
 
-    # Убираем дубли из одной статьи (макс 1 чанк на статью)
     unique_results = {}
     for doc in mmr_results:
-        # ИСПРАВЛЕНИЕ: Используем pubmed_id как основной идентификатор статьи
         pub_id = doc.metadata.get("pubmed_id", doc.metadata.get("id", "unknown"))
-
-        # Если статья уже добавлена, пропускаем
         if pub_id in unique_results:
             continue
-
-        # Получаем скор для этого документа
         score = doc_to_score.get(doc.metadata["id"], 0.0)
         unique_results[pub_id] = (doc, score)
-
-        # Прекращаем, когда набрали достаточно уникальных статей
         if len(unique_results) >= k:
             break
 
-    # Сортируем результаты по скору перед возвратом
     sorted_results = sorted(unique_results.values(), key=lambda x: x[1], reverse=True)
-
-    # Разделяем результаты и скоры
     docs = [item[0] for item in sorted_results]
     scores = [item[1] for item in sorted_results]
 
     return docs, scores
 
-# Функция форматирования сообщений
+# Функция форматирования сообщений (без изменений)
 def format_zephyr_rag_messages(query, retrieved_docs):
-    """Возвращает (messages, assembled_context_str, context_parts_list)"""
     context_parts = []
     for i, doc in enumerate(retrieved_docs):
         metadata = doc.metadata or {}
         source_info = f"[Source {i+1}]"
-        if "title" in metadata:
+        if "title" in meta:
             source_info += f" '{metadata['title']}'"
         if "pubmed_id" in metadata:
             source_info += f" (PMID: {metadata['pubmed_id']})"
-
         content = doc.page_content if hasattr(doc, "page_content") else getattr(doc, "content", str(doc))
-        # не усекать здесь — собираем полный кусок; тримить можно при печати
         context_parts.append({"source": source_info, "content": content, "metadata": metadata})
 
-    # собираем текст контекста в одну строку (для логирования / токенизации)
     assembled_context = "\n\n".join(f"{p['source']}\n{p['content']}" for p in context_parts)
 
     messages = [
@@ -247,15 +237,10 @@ def format_zephyr_rag_messages(query, retrieved_docs):
     ]
     return messages, assembled_context, context_parts
 
-# Класс для остановки генерации
+# Класс для остановки генерации (без изменений)
 class StopOnSubsequences(StoppingCriteria):
-    """
-    Останавливает генерацию, когда последний сгенерированный фрагмент
-    оканчивается на любую из переданных подпоследовательностей токенов.
-    """
     def __init__(self, stop_sequences_ids):
-        # stop_sequences_ids: list of list of ints
-        self.stop_sequences_ids = [seq for seq in stop_sequences_ids if seq]  # фильтруем пустые
+        self.stop_sequences_ids = [seq for seq in stop_sequences_ids if seq]
 
     def _ends_with(self, haystack, needle):
         n = len(needle)
@@ -264,19 +249,18 @@ class StopOnSubsequences(StoppingCriteria):
         return haystack[-n:] == needle
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        # Работает с первым (и обычно единственным) элементом батча
         last = input_ids[0].tolist()
         for seq in self.stop_sequences_ids:
             if self._ends_with(last, seq):
                 return True
         return False
 
-# Основная функция RAG-пайплайна
+# Основная функция RAG-пайплайна (оптимизированная для Cloud Run)
 def zephyr_rag_pipeline(query: str, k: int = 3, max_new_tokens: int = 350, min_relevance: float = MIN_RELEVANCE_THRESHOLD):
-    """
-    Возвращает: answer, confidence, retrieved_docs, scores, full_generated_text, context_used,
-                assembled_context (строка), context_parts (list of dicts with source/content/metadata)
-    """
+    if IS_CLOUD_RUN:
+        k = min(k, 2)  # Ограничиваем количество документов в Cloud Run
+        max_new_tokens = min(max_new_tokens, 150)  # Уменьшаем длину генерации
+
     retrieved_docs, scores = smart_retrieve(query, k=k)
     if not scores or max(scores) < min_relevance:
         return {
@@ -288,27 +272,23 @@ def zephyr_rag_pipeline(query: str, k: int = 3, max_new_tokens: int = 350, min_r
             "context_parts": []
         }
 
-    # Получаем теперь тройку: messages, assembled_context и отдельные части
     messages, assembled_context, context_parts = format_zephyr_rag_messages(query, retrieved_docs)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    # Токенизация промпта
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=512,
+        max_length=MAX_CONTEXT_LENGTH,
         padding=True
     )
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-    # гарантируем pad token
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
 
     eos_token_id = tokenizer.eos_token_id
 
-    # сбор стоп-маркеров как у вас был
     stop_markers = [
         "<|end|>", "<|user|>", "<|assistant|>", "</s>",
         "<| user|>", "<|Assistant|>", "<||user|>", "<|User|>"
@@ -359,7 +339,6 @@ def zephyr_rag_pipeline(query: str, k: int = 3, max_new_tokens: int = 350, min_r
         if pos != -1:
             start_idx = pos + len(assistant_ids)
 
-    # find nearest stop
     end_idx = None
     for stop_ids in stop_ids_list:
         n = len(stop_ids)
@@ -376,7 +355,6 @@ def zephyr_rag_pipeline(query: str, k: int = 3, max_new_tokens: int = 350, min_r
 
     answer = tokenizer.decode(answer_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True).strip()
 
-    # постобработка как у вас была
     end_marker_phrase = "This conclusion is based strictly on the specific medical evidence provided in the context."
     low_ans = answer.lower()
     if end_marker_phrase.lower() in low_ans:
@@ -395,7 +373,6 @@ def zephyr_rag_pipeline(query: str, k: int = 3, max_new_tokens: int = 350, min_r
     if not answer:
         answer = "Based on the available medical sources, I cannot give a definitive answer to this question."
 
-    # определяем использование источников
     context_used = False
     try:
         for i in range(1, k + 1):
@@ -435,8 +412,10 @@ async def query_rag(request: QueryRequest):
         )
         return result
     except Exception as e:
+        logger.exception(f"Ошибка при обработке запроса: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
