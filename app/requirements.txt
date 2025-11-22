@@ -1,0 +1,18 @@
+fastapi
+uvicorn
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.2.1+cpu
+transformers
+sentencepiece
+peft
+langchain
+langchain-community
+langchain-core
+langchain-huggingface
+sentence-transformers
+faiss-cpu
+tiktoken
+tqdm
+numpy==1.26.4
+bitsandbytes>=0.41.0
+accelerate>=0.21.0

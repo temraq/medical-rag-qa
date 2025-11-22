@@ -1,0 +1,36 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  rag-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile  # ваш основной Dockerfile для FastAPI
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./index:/app/index
+      - ./logs:/app/logs
+      - ./offload:/app/offload
+    environment:
+      - MODEL_NAME=HuggingFaceH4/zephyr-7b-beta
+      - ADAPTERS_PATH=/app/models/zephyr_medical_rag_adapter
+      - INDEX_PATH=/app/index/pubmed_rag_index
+      - EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+    deploy:
+      resources:
+        reservations:
+          cpus: '2'
+          memory: '8G'
+
+  gradio-ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gradio
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./logs:/app/logs 
+    depends_on:
+      - rag-api

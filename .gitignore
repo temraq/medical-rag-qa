@@ -1,0 +1,34 @@
+# ------------------------
+# Игнорируем ТОЛЬКО содержимое папок, но оставляем структуру
+# ------------------------
+models/zephyr_base_model/*
+!models/zephyr_base_model/.gitkeep
+models/zephyr_medical_rag_adapter/*
+!models/zephyr_medical_rag_adapter/.gitkeep
+index/pubmed_rag_index/*
+!index/pubmed_rag_index/.gitkeep
+
+# ------------------------
+# Остальное содержимое (ваш текущий .gitignore)
+# ------------------------
+*.pyc
+__pycache__/
+*.log
+*.tmp
+*.DS_Store
+*.swp
+*.swo
+*.pid
+*.lock
+.idea/
+.vscode/
+venv/
+env/
+.venv/
+offload/*
+!offload/.gitkeep
+logs/*
+!logs/.gitkeep
+docker-compose.override.yml
+.DS_Store
+Thumbs.db
