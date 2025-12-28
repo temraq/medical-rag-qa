@@ -24,3 +24,5 @@ index/pubmed_rag_index/*
 !index/pubmed_rag_index/.gitkeep
 models/*
 !models/.gitkeep
+
+index/*
