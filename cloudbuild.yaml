@@ -2,20 +2,20 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   args: [
     'build',
-    '-t', 'europe-west1-docker.pkg.dev/project-caad2eac-d330-46c8-a42/medical-rag-qa/medical-rag-qa-git:$COMMIT_SHA',
+    '-t', 'europe-west1-docker.pkg.dev/project-caad2eac-d330-46c8-a42/cloud-run-source-deploy/medical-rag-qa/medical-rag-qa-git:$COMMIT_SHA',
     '-f', 'Dockerfile',
     '.'
   ]
   id: 'build'
 - name: 'gcr.io/cloud-builders/docker'
   args: [
-    'push', 'europe-west1-docker.pkg.dev/project-caad2eac-d330-46c8-a42/medical-rag-qa/medical-rag-qa-git:$COMMIT_SHA'
+    'push', 'europe-west1-docker.pkg.dev/project-caad2eac-d330-46c8-a42/cloud-run-source-deploy/medical-rag-qa/medical-rag-qa-git:$COMMIT_SHA'
   ]
   id: 'push'
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
   args: [
     'gcloud', 'run', 'deploy', 'medical-rag-qa-git',
-    '--image', 'europe-west1-docker.pkg.dev/project-caad2eac-d330-46c8-a42/medical-rag-qa/medical-rag-qa-git:$COMMIT_SHA',
+    '--image', 'europe-west1-docker.pkg.dev/project-caad2eac-d330-46c8-a42/cloud-run-source-deploy/medical-rag-qa/medical-rag-qa-git:$COMMIT_SHA',
     '--platform', 'managed',
     '--region', 'europe-west1',
     '--port', '8080',
@@ -23,7 +23,3 @@ steps:
     '--set-env-vars', 'GCS_BUCKET_NAME=medical-rag-models'
   ]
   id: 'deploy'
-images:
-- 'europe-west1-docker.pkg.dev/project-caad2eac-d330-46c8-a42/medical-rag-qa/medical-rag-qa-git:$COMMIT_SHA'
-options:
-  logging: CLOUD_LOGGING_ONLY
