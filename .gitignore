@@ -19,3 +19,8 @@ logs/*
 docker-compose.override.yml
 .DS_Store
 Thumbs.db
+
+index/pubmed_rag_index/*
+!index/pubmed_rag_index/.gitkeep
+models/*
+!models/.gitkeep
