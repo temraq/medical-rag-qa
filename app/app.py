@@ -496,7 +496,7 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8081))
     logger.info(f"🚀 Запуск сервера на порту {port}")
     
     # Добавляем startup event для логгирования
