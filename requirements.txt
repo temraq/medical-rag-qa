@@ -16,3 +16,6 @@ tqdm
 numpy==1.26.4
 bitsandbytes>=0.41.0
 accelerate>=0.21.0
+google-cloud-storage==2.14.0
+google-auth==2.26.2
+python-multipart==0.0.7

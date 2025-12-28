@@ -9,13 +9,15 @@ from datetime import datetime
 import logging
 import os
 import time
+from google.cloud import storage
+from google.auth.exceptions import DefaultCredentialsError
 
 # 🎯 НАСТРОЙКА ЛОГИРОВАНИЯ
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler("/tmp/api.log"),  # Cloud Run использует /tmp
+        logging.FileHandler("/tmp/api.log"),
         logging.StreamHandler()
     ]
 )
@@ -27,10 +29,18 @@ app = FastAPI()
 IS_CLOUD_RUN = os.environ.get("K_SERVICE") is not None
 
 # Конфигурация моделей (пути для загрузки из GCS)
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "your-bucket-name")
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "")
 MODEL_GCS_PATH = os.environ.get("MODEL_GCS_PATH", "zephyr-7b-base")
 ADAPTERS_GCS_PATH = os.environ.get("ADAPTERS_GCS_PATH", "zephyr-medical-adapter")
 INDEX_GCS_PATH = os.environ.get("INDEX_GCS_PATH", "pubmed-rag-index")
+
+# Проверка обязательных переменных окружения
+REQUIRED_ENV_VARS = ["GCS_BUCKET_NAME"]
+missing_vars = [var for var in REQUIRED_ENV_VARS if not os.environ.get(var)]
+if missing_vars and IS_CLOUD_RUN:
+    error_msg = f"❌ Отсутствуют обязательные переменные окружения: {', '.join(missing_vars)}"
+    logger.error(error_msg)
+    raise EnvironmentError(error_msg)
 
 # Локальные пути внутри контейнера
 BASE_DIR = "/app"
@@ -43,9 +53,10 @@ MIN_RELEVANCE_THRESHOLD = 0.55
 MAX_CONTEXT_LENGTH = 512 if not IS_CLOUD_RUN else 384  # Уменьшаем для Cloud Run
 
 logger.info(f"🚀 Запуск RAG API сервера в режиме: {'Cloud Run' if IS_CLOUD_RUN else 'Local'}")
+logger.info(f"📦 Bucket: {GCS_BUCKET_NAME}, Model path: {MODEL_GCS_PATH}")
 
 def download_from_gcs(bucket_name, gcs_path, local_path):
-    """Загружает файлы из Google Cloud Storage"""
+    """Загружает файлы из Google Cloud Storage с использованием Python SDK"""
     if not bucket_name:
         logger.warning("GCS_BUCKET_NAME не указан, пропускаем загрузку")
         return False
@@ -54,14 +65,49 @@ def download_from_gcs(bucket_name, gcs_path, local_path):
         os.makedirs(local_path, exist_ok=True)
         logger.info(f"⬇️ Загрузка из gs://{bucket_name}/{gcs_path} в {local_path}")
         
-        # Используем gsutil для загрузки
-        import subprocess
-        cmd = f"gsutil -m cp -r gs://{bucket_name}/{gcs_path}/* {local_path}/"
-        result = subprocess.run(cmd, shell=True, check=True, text=True, capture_output=True)
-        logger.info(f"✅ Загрузка успешна: {result.stdout}")
-        return True
+        # Инициализация клиента GCS
+        try:
+            storage_client = storage.Client()
+            logger.info("✅ GCS клиент инициализирован успешно")
+        except DefaultCredentialsError as e:
+            logger.error(f"❌ Ошибка аутентификации GCS: {e}")
+            logger.info("🔄 Попытка использовать анонимный доступ...")
+            storage_client = storage.Client.create_anonymous_client()
+        
+        bucket = storage_client.bucket(bucket_name)
+        
+        # Получение списка всех файлов в директории
+        blobs = bucket.list_blobs(prefix=f"{gcs_path}/")
+        total_files = 0
+        downloaded_files = 0
+        
+        start_time = time.time()
+        
+        for blob in blobs:
+            total_files += 1
+            # Пропускаем саму директорию
+            if blob.name.endswith('/'):
+                continue
+                
+            # Создаем локальный путь
+            relative_path = blob.name[len(gcs_path):].lstrip('/')
+            local_file_path = os.path.join(local_path, relative_path)
+            
+            # Создаем директории если нужно
+            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+            
+            # Скачиваем файл
+            logger.info(f"📥 Скачивание: {blob.name} -> {local_file_path}")
+            blob.download_to_filename(local_file_path)
+            downloaded_files += 1
+            logger.info(f"✅ Загружено: {local_file_path}")
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"✅ Загрузка завершена: {downloaded_files}/{total_files} файлов за {elapsed_time:.2f} секунд")
+        return downloaded_files > 0
+        
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки из GCS: {e}")
+        logger.error(f"❌ Ошибка загрузки из GCS: {e}", exc_info=True)
         return False
 
 def ensure_models_available():
@@ -71,17 +117,23 @@ def ensure_models_available():
     # Загружаем базовую модель
     if not os.path.exists(MODEL_LOCAL_PATH) or not os.listdir(MODEL_LOCAL_PATH):
         logger.info("🔄 Базовая модель отсутствует - загружаем из GCS")
-        download_from_gcs(GCS_BUCKET_NAME, MODEL_GCS_PATH, MODEL_LOCAL_PATH)
+        success = download_from_gcs(GCS_BUCKET_NAME, MODEL_GCS_PATH, MODEL_LOCAL_PATH)
+        if not success:
+            logger.error("❌ Не удалось загрузить базовую модель")
     
     # Загружаем адаптеры
     if not os.path.exists(ADAPTERS_LOCAL_PATH) or not os.listdir(ADAPTERS_LOCAL_PATH):
         logger.info("🔄 Адаптеры отсутствуют - загружаем из GCS")
-        download_from_gcs(GCS_BUCKET_NAME, ADAPTERS_GCS_PATH, ADAPTERS_LOCAL_PATH)
+        success = download_from_gcs(GCS_BUCKET_NAME, ADAPTERS_GCS_PATH, ADAPTERS_LOCAL_PATH)
+        if not success:
+            logger.error("❌ Не удалось загрузить адаптеры")
     
     # Загружаем индекс
     if not os.path.exists(INDEX_LOCAL_PATH) or not os.listdir(INDEX_LOCAL_PATH):
         logger.info("🔄 FAISS индекс отсутствует - загружаем из GCS")
-        download_from_gcs(GCS_BUCKET_NAME, INDEX_GCS_PATH, INDEX_LOCAL_PATH)
+        success = download_from_gcs(GCS_BUCKET_NAME, INDEX_GCS_PATH, INDEX_LOCAL_PATH)
+        if not success:
+            logger.error("❌ Не удалось загрузить FAISS индекс")
     
     # Проверяем результат
     paths = {
@@ -100,7 +152,10 @@ def ensure_models_available():
     logger.info("✅ Все компоненты успешно загружены")
 
 # Загрузка моделей перед запуском API
+logger.info("⏳ Начинаем загрузку моделей...")
+start_time = time.time()
 ensure_models_available()
+logger.info(f"✅ Модели загружены за {time.time() - start_time:.2f} секунд")
 
 # Инициализация моделей
 tokenizer = None
@@ -121,12 +176,15 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.float16
 )
 
+# Оптимизация для Cloud Run - используем CPU offload и меньше памяти
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_LOCAL_PATH,
     quantization_config=bnb_config,
     device_map="auto",
     offload_folder="/tmp/offload",
-    trust_remote_code=False
+    trust_remote_code=False,
+    use_cache=True,
+    low_cpu_mem_usage=True
 )
 
 logger.info("🔧 Применение адаптеров...")
@@ -208,7 +266,7 @@ def format_zephyr_rag_messages(query, retrieved_docs):
     for i, doc in enumerate(retrieved_docs):
         metadata = doc.metadata or {}
         source_info = f"[Source {i+1}]"
-        if "title" in meta:
+        if "title" in metadata:
             source_info += f" '{metadata['title']}'"
         if "pubmed_id" in metadata:
             source_info += f" (PMID: {metadata['pubmed_id']})"
@@ -405,17 +463,51 @@ class QueryRequest(BaseModel):
 @app.post("/query")
 async def query_rag(request: QueryRequest):
     try:
+        logger.info(f"🔍 Получен запрос: {request.query}")
+        start_time = time.time()
+        
         result = zephyr_rag_pipeline(
             query=request.query,
             k=request.k,
             min_relevance=request.min_relevance
         )
+        
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Запрос обработан за {processing_time:.2f} секунд, confidence: {result['confidence']}")
+        
         return result
     except Exception as e:
-        logger.exception(f"Ошибка при обработке запроса: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"❌ Ошибка при обработке запроса: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Cloud Run"""
+    return {
+        "status": "healthy",
+        "models_loaded": all([
+            tokenizer is not None,
+            model is not None,
+            vector_db is not None
+        ]),
+        "environment": "Cloud Run" if IS_CLOUD_RUN else "Local",
+        "timestamp": datetime.now().isoformat()
+    }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    logger.info(f"🚀 Запуск сервера на порту {port}")
+    
+    # Добавляем startup event для логгирования
+    @app.on_event("startup")
+    async def startup_event():
+        logger.info("✅ API сервер запущен и готов принимать запросы")
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info",
+        timeout_keep_alive=300  # Увеличиваем таймаут для Cloud Run
+    )
