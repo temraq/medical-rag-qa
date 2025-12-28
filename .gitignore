@@ -25,4 +25,5 @@ index/pubmed_rag_index/*
 models/*
 !models/.gitkeep
 
-index/*
+index/*index/
+models/
