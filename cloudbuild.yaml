@@ -12,11 +12,23 @@ steps:
     '--platform', 'managed',
     '--region', 'europe-west1',
     '--port', '8080',
-    '--timeout', '300',  # Extend timeout to 5 minutes
-    '--set-env-vars', 'GCS_BUCKET_NAME=$_GCS_BUCKET_NAME'
+    '--timeout', '900',  # 15 minutes for heavy model loading
+    '--cpu', '1',
+    '--memory', '2Gi',  # Minimum for 4-bit model
+    '--concurrency', '1',  # Only one request at a time
+    '--min-instances', '0',
+    '--max-instances', '1',
+    '--set-env-vars', 'GCS_BUCKET_NAME=medical-rag-models',
+    '--service-account', '$_SERVICE_ACCOUNT_EMAIL',
+    '--allow-unauthenticated',
+    '--no-cpu-throttling'
   ]
   id: 'deploy'
 images:
 - '$_GCR_HOSTNAME/$PROJECT_ID/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA'
 options:
   logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'  # More powerful build machine
+
+substitutions:
+  _SERVICE_ACCOUNT_EMAIL: 'your-service-account@project-caad2eac-d330-46c8-a42.iam.gserviceaccount.com'

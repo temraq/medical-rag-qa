@@ -11,6 +11,7 @@ import os
 import time
 from google.cloud import storage
 from google.auth.exceptions import DefaultCredentialsError
+import traceback
 
 # 🎯 НАСТРОЙКА ЛОГИРОВАНИЯ
 logging.basicConfig(
@@ -28,23 +29,13 @@ app = FastAPI()
 # Автоматическое определение окружения Cloud Run
 IS_CLOUD_RUN = os.environ.get("K_SERVICE") is not None
 
-# Конфигурация моделей (пути для загрузки из GCS)
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "")
-MODEL_GCS_PATH = os.environ.get("MODEL_GCS_PATH", "zephyr-7b-base")
-ADAPTERS_GCS_PATH = os.environ.get("ADAPTERS_GCS_PATH", "zephyr-medical-adapter")
-INDEX_GCS_PATH = os.environ.get("INDEX_GCS_PATH", "pubmed-rag-index")
-
-# Проверка обязательных переменных окружения
-REQUIRED_ENV_VARS = ["GCS_BUCKET_NAME"]
-missing_vars = [var for var in REQUIRED_ENV_VARS if not os.environ.get(var)]
-if missing_vars and IS_CLOUD_RUN:
-    error_msg = f"❌ Отсутствуют обязательные переменные окружения: {', '.join(missing_vars)}"
-    logger.error(error_msg)
-    raise EnvironmentError(error_msg)
+# Конфигурация путей (адаптеры и индекс из GCS, модель напрямую из Hugging Face)
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "medical-rag-models")
+ADAPTERS_GCS_PATH = os.environ.get("ADAPTERS_GCS_PATH", "zephyr_medical_rag_adapter")  # Обратите внимание на подчеркивание
+INDEX_GCS_PATH = os.environ.get("INDEX_GCS_PATH", "pubmed_rag_index")  # Обратите внимание на подчеркивание
 
 # Локальные пути внутри контейнера
 BASE_DIR = "/app"
-MODEL_LOCAL_PATH = f"{BASE_DIR}/models/zephyr_base_model"
 ADAPTERS_LOCAL_PATH = f"{BASE_DIR}/models/zephyr_medical_rag_adapter"
 INDEX_LOCAL_PATH = f"{BASE_DIR}/index/pubmed_rag_index"
 
@@ -53,7 +44,9 @@ MIN_RELEVANCE_THRESHOLD = 0.55
 MAX_CONTEXT_LENGTH = 512 if not IS_CLOUD_RUN else 384  # Уменьшаем для Cloud Run
 
 logger.info(f"🚀 Запуск RAG API сервера в режиме: {'Cloud Run' if IS_CLOUD_RUN else 'Local'}")
-logger.info(f"📦 Bucket: {GCS_BUCKET_NAME}, Model path: {MODEL_GCS_PATH}")
+logger.info(f"📦 GCS Bucket: {GCS_BUCKET_NAME}")
+logger.info(f"🔧 Adapters path: {ADAPTERS_GCS_PATH}")
+logger.info(f"🔍 Index path: {INDEX_GCS_PATH}")
 
 def download_from_gcs(bucket_name, gcs_path, local_path):
     """Загружает файлы из Google Cloud Storage с использованием Python SDK"""
@@ -108,18 +101,12 @@ def download_from_gcs(bucket_name, gcs_path, local_path):
         
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки из GCS: {e}", exc_info=True)
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         return False
 
 def ensure_models_available():
-    """Гарантирует наличие всех моделей и индекса"""
-    logger.info("🔍 Проверка наличия моделей и индекса...")
-    
-    # Загружаем базовую модель
-    if not os.path.exists(MODEL_LOCAL_PATH) or not os.listdir(MODEL_LOCAL_PATH):
-        logger.info("🔄 Базовая модель отсутствует - загружаем из GCS")
-        success = download_from_gcs(GCS_BUCKET_NAME, MODEL_GCS_PATH, MODEL_LOCAL_PATH)
-        if not success:
-            logger.error("❌ Не удалось загрузить базовую модель")
+    """Гарантирует наличие адаптеров и индекса из GCS"""
+    logger.info("🔍 Проверка наличия адаптеров и индекса...")
     
     # Загружаем адаптеры
     if not os.path.exists(ADAPTERS_LOCAL_PATH) or not os.listdir(ADAPTERS_LOCAL_PATH):
@@ -127,6 +114,7 @@ def ensure_models_available():
         success = download_from_gcs(GCS_BUCKET_NAME, ADAPTERS_GCS_PATH, ADAPTERS_LOCAL_PATH)
         if not success:
             logger.error("❌ Не удалось загрузить адаптеры")
+            raise RuntimeError("Не удалось загрузить адаптеры из GCS")
     
     # Загружаем индекс
     if not os.path.exists(INDEX_LOCAL_PATH) or not os.listdir(INDEX_LOCAL_PATH):
@@ -134,10 +122,10 @@ def ensure_models_available():
         success = download_from_gcs(GCS_BUCKET_NAME, INDEX_GCS_PATH, INDEX_LOCAL_PATH)
         if not success:
             logger.error("❌ Не удалось загрузить FAISS индекс")
+            raise RuntimeError("Не удалось загрузить FAISS индекс из GCS")
     
     # Проверяем результат
     paths = {
-        "базовая модель": MODEL_LOCAL_PATH,
         "адаптеры": ADAPTERS_LOCAL_PATH,
         "индекс": INDEX_LOCAL_PATH
     }
@@ -151,64 +139,111 @@ def ensure_models_available():
     
     logger.info("✅ Все компоненты успешно загружены")
 
-# Загрузка моделей перед запуском API
-logger.info("⏳ Начинаем загрузку моделей...")
-start_time = time.time()
-ensure_models_available()
-logger.info(f"✅ Модели загружены за {time.time() - start_time:.2f} секунд")
-
 # Инициализация моделей
 tokenizer = None
 model = None
 vector_db = None
 
-logger.info("\n📦 Загрузка токенизатора...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_LOCAL_PATH)
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
-logger.info("✅ Токенизатор загружен.")
+async def load_models_background():
+    """Загружает модели в фоновом режиме с подробным логгированием"""
+    global tokenizer, model, vector_db
+    
+    logger.info("⏳ Начинаем загрузку моделей...")
+    start_time_total = time.time()
+    
+    try:
+        # Шаг 1: Загрузка адаптеров и индекса из GCS
+        logger.info("📥 Шаг 1: Загрузка адаптеров и индекса из GCS...")
+        start_time = time.time()
+        ensure_models_available()
+        logger.info(f"✅ Шаг 1 завершен за {time.time() - start_time:.2f} секунд")
+        
+        # Шаг 2: Загрузка базовой модели напрямую из Hugging Face
+        logger.info("📥 Шаг 2: Загрузка базовой модели Zephyr из Hugging Face...")
+        start_time = time.time()
+        
+        model_name = "HuggingFaceH4/zephyr-7b-beta"
+        logger.info(f"📦 Загрузка токенизатора для {model_name}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        logger.info(f"✅ Токенизатор загружен за {time.time() - start_time:.2f} секунд")
+        
+        # Загрузка модели в 4-bit
+        logger.info("🤖 Загрузка модели в 4-bit режиме...")
+        start_time = time.time()
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16
+        )
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            offload_folder="/tmp/offload",
+            trust_remote_code=False,
+            use_cache=True,
+            low_cpu_mem_usage=True
+        )
+        
+        logger.info(f"✅ Базовая модель загружена за {time.time() - start_time:.2f} секунд")
+        
+        # Шаг 3: Применение адаптеров
+        logger.info("🔧 Шаг 3: Применение адаптеров...")
+        start_time = time.time()
+        model = PeftModel.from_pretrained(model, ADAPTERS_LOCAL_PATH)
+        model.eval()
+        logger.info(f"✅ Адаптеры применены за {time.time() - start_time:.2f} секунд")
+        
+        # Шаг 4: Загрузка FAISS индекса
+        logger.info("🔍 Шаг 4: Загрузка FAISS индекса...")
+        start_time = time.time()
+        embedding_model = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+            encode_kwargs={"normalize_embeddings": True}
+        )
+        
+        logger.info(f"Loading FAISS index from {INDEX_LOCAL_PATH}...")
+        vector_db = FAISS.load_local(
+            INDEX_LOCAL_PATH,
+            embedding_model,
+            allow_dangerous_deserialization=True
+        )
+        logger.info(f"✅ FAISS индекс загружен за {time.time() - start_time:.2f} секунд")
+        
+        total_time = time.time() - start_time_total
+        logger.info(f"🎉 Все модели успешно загружены за {total_time:.2f} секунд")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА при загрузке моделей: {e}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        return False
 
-logger.info("\n🤖 Загрузка модели в 4-bit для Cloud Run...")
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16
-)
-
-# Оптимизация для Cloud Run - используем CPU offload и меньше памяти
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_LOCAL_PATH,
-    quantization_config=bnb_config,
-    device_map="auto",
-    offload_folder="/tmp/offload",
-    trust_remote_code=False,
-    use_cache=True,
-    low_cpu_mem_usage=True
-)
-
-logger.info("🔧 Применение адаптеров...")
-model = PeftModel.from_pretrained(model, ADAPTERS_LOCAL_PATH)
-model.eval()
-logger.info("✅ Модель и адаптеры загружены.")
-
-logger.info("🌐 Загрузка модели эмбеддингов...")
-embedding_model = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL,
-    model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-    encode_kwargs={"normalize_embeddings": True}
-)
-
-logger.info(f"Loading FAISS index from {INDEX_LOCAL_PATH}...")
-vector_db = FAISS.load_local(
-    INDEX_LOCAL_PATH,
-    embedding_model,
-    allow_dangerous_deserialization=True
-)
-logger.info("✅ FAISS index loaded successfully.")
+# Фоновая загрузка моделей при запуске
+@app.on_event("startup")
+async def startup_event():
+    """Запускает загрузку моделей в фоновом режиме при старте приложения"""
+    logger.info("🚀 Запуск API сервера...")
+    logger.info("🔄 Запуск фоновой загрузки моделей...")
+    
+    # Запускаем загрузку моделей в фоновом режиме
+    import threading
+    threading.Thread(target=lambda: asyncio.run(load_models_background()), daemon=True).start()
+    
+    logger.info("✅ API сервер запущен и готов принимать запросы (модели загружаются в фоне)")
 
 # Функция smart_retrieve (без изменений)
 def smart_retrieve(query, k=3):
+    if vector_db is None:
+        logger.warning("Векторная база данных не загружена, возвращаем пустой результат")
+        return [], []
+    
     base_results = vector_db.similarity_search_with_relevance_scores(query, k=20)
     doc_to_score = {doc.metadata["id"]: score for doc, score in base_results}
 
@@ -220,7 +255,7 @@ def smart_retrieve(query, k=3):
     is_guideline = any(kw in query_lower for kw in medical_guideline_keywords)
     is_diagnostic = any(kw in query_lower for kw in diagnostic_keywords)
     is_treatment = any(kw in query_lower for kw in treatment_keywords)
-    token_count = len(tokenizer.encode(query))
+    token_count = len(tokenizer.encode(query)) if tokenizer else 0
 
     if is_guideline:
         lam = 0.98
@@ -315,6 +350,15 @@ class StopOnSubsequences(StoppingCriteria):
 
 # Основная функция RAG-пайплайна (оптимизированная для Cloud Run)
 def zephyr_rag_pipeline(query: str, k: int = 3, max_new_tokens: int = 350, min_relevance: float = MIN_RELEVANCE_THRESHOLD):
+    # Проверка, загружены ли модели
+    if model is None or tokenizer is None or vector_db is None:
+        logger.warning("⚠️ Модели еще не загружены полностью, возвращаем сообщение о загрузке")
+        return {
+            "answer": "Service is still loading models. Please try again in a few moments.",
+            "confidence": "low",
+            "status": "loading"
+        }
+    
     if IS_CLOUD_RUN:
         k = min(k, 2)  # Ограничиваем количество документов в Cloud Run
         max_new_tokens = min(max_new_tokens, 150)  # Уменьшаем длину генерации
@@ -473,7 +517,7 @@ async def query_rag(request: QueryRequest):
         )
         
         processing_time = time.time() - start_time
-        logger.info(f"✅ Запрос обработан за {processing_time:.2f} секунд, confidence: {result['confidence']}")
+        logger.info(f"✅ Запрос обработан за {processing_time:.2f} секунд, confidence: {result.get('confidence', 'unknown')}")
         
         return result
     except Exception as e:
@@ -483,31 +527,49 @@ async def query_rag(request: QueryRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint for Cloud Run"""
+    models_ready = all([
+        tokenizer is not None,
+        model is not None,
+        vector_db is not None
+    ])
+    
+    status = "healthy" if models_ready else "loading"
+    
     return {
-        "status": "healthy",
-        "models_loaded": all([
-            tokenizer is not None,
-            model is not None,
-            vector_db is not None
-        ]),
+        "status": status,
+        "models_loaded": models_ready,
         "environment": "Cloud Run" if IS_CLOUD_RUN else "Local",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "components": {
+            "tokenizer": tokenizer is not None,
+            "model": model is not None,
+            "vector_db": vector_db is not None,
+            "adapters_path": os.path.exists(ADAPTERS_LOCAL_PATH) and os.listdir(ADAPTERS_LOCAL_PATH),
+            "index_path": os.path.exists(INDEX_LOCAL_PATH) and os.listdir(INDEX_LOCAL_PATH)
+        }
     }
+
+@app.get("/ readiness")
+async def readiness_check():
+    """Readiness check - returns 200 only when all models are loaded"""
+    if not all([tokenizer is not None, model is not None, vector_db is not None]):
+        raise HTTPException(status_code=503, detail="Models are still loading")
+    
+    return {"status": "ready", "message": "All models loaded successfully"}
 
 if __name__ == "__main__":
     import uvicorn
+    import asyncio
+    
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"🚀 Запуск сервера на порту {port}")
-    
-    # Добавляем startup event для логгирования
-    @app.on_event("startup")
-    async def startup_event():
-        logger.info("✅ API сервер запущен и готов принимать запросы")
     
     uvicorn.run(
         app, 
         host="0.0.0.0", 
         port=port,
         log_level="info",
-        timeout_keep_alive=300  # Увеличиваем таймаут для Cloud Run
+        timeout_keep_alive=300,
+        # Добавляем больший таймаут для запуска
+        timeout_graceful_shutdown=30
     )
