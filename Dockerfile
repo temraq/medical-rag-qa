@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Установка системных зависимостей (убрана установка Google Cloud SDK)
+# Установка системных зависимостей (убираем GCS SDK)
 RUN apt-get update && apt-get install -y \
     curl \
     git \

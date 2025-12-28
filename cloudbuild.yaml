@@ -1,32 +1,21 @@
 steps:
-# Debug workspace structure first
-- name: 'gcr.io/cloud-builders/git'
-  entrypoint: 'bash'
-  args:
-  - '-c'
-  - |
-    echo "🔍 DEBUGGING WORKSPACE STRUCTURE..."
-    echo "Current directory: $(pwd)"
-    echo "Files in workspace:"
-    ls -la
-    echo "Dockerfile check:"
-    ls -la Dockerfile 2>/dev/null || echo "❌ Dockerfile not found (case-sensitive)"
-    ls -la dockerfile 2>/dev/null || echo "❌ dockerfile not found (lowercase)"
-    echo "All files:"
-    find . -type f | grep -i docker
-  id: 'debug-dockerfile'
-
-# Original build step (wait for debug to complete)
 - name: 'gcr.io/cloud-builders/docker'
   args: ['build', '-t', '$_GCR_HOSTNAME/$PROJECT_ID/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA', '-f', 'Dockerfile', '.']
   id: 'build'
-  waitFor: ['debug-dockerfile']
-
-# Original push step
 - name: 'gcr.io/cloud-builders/docker'
   args: ['push', '$_GCR_HOSTNAME/$PROJECT_ID/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA']
   id: 'push'
-
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+  args: [
+    'gcloud', 'run', 'deploy', '$_SERVICE_NAME',
+    '--image', '$_GCR_HOSTNAME/$PROJECT_ID/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA',
+    '--platform', 'managed',
+    '--region', 'europe-west1',
+    '--port', '8080',
+    '--timeout', '300',  # Extend timeout to 5 minutes
+    '--set-env-vars', 'GCS_BUCKET_NAME=$_GCS_BUCKET_NAME'
+  ]
+  id: 'deploy'
 images:
 - '$_GCR_HOSTNAME/$PROJECT_ID/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA'
 options:
