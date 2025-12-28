@@ -1,19 +1,13 @@
-# Dockerfile
 FROM python:3.10-slim
 
-# Установка системных зависимостей
+# Установка системных зависимостей (убрана установка Google Cloud SDK)
 RUN apt-get update && apt-get install -y \
     curl \
     git \
     build-essential \
     libgl1 \
-    # Установка Google Cloud SDK
-    gnupg \
-    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list \
-    && curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - \
-    && apt-get update && apt-get install -y google-cloud-sdk \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
 
 # Рабочая директория
 WORKDIR /app
