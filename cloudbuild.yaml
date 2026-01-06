@@ -22,6 +22,10 @@ steps:
     '--region', 'europe-west1',
     '--port', '8080',
     '--timeout', '1200',
+    '--timeout', '1200',  # 20 minutes for request timeout
+    '--max-instances', '1',  # Start with 1 instance
+    '--cpu', '2',  # More CPU for model loading
+    '--memory', '4Gi',  # More memory for large models
     '--set-env-vars', 'GCS_BUCKET_NAME=medical-rag-models'
   ]
   id: 'deploy'
