@@ -30,4 +30,4 @@ RUN mkdir -p /app/models/zephyr_base_model \
 EXPOSE 8080
 
 # Запуск приложения
-CMD ["python", "app.py"]
+CMD ["python", "app/app.py"]
